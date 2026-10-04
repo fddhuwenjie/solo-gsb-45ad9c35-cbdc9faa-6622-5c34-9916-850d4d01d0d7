@@ -15,6 +15,7 @@ from .db import (
     Database,
     LeaseConflict,
     LeaseNotFound,
+    QuarantineConflict,
     ReplayConflict,
     VersionConflict,
     VersionNotFound,
@@ -33,6 +34,8 @@ from .models import (
     LeaseRecoverRequest,
     LibraryImportRequest,
     PatrolAnalyzeRequest,
+    QuarantineReleaseRequest,
+    QuarantineRequest,
     ReplayReportRequest,
     VersionCreateRequest,
 )
@@ -121,8 +124,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "租约；完成时逐项核对摘要并在同事务写确认、推进水位、释放租约，"
             "摘要变化/缺批次/租约过期整体拒绝且不推进；归档不清除租约占用的"
             "明细，过期租约显式回收后方可重新领取。"
+            "链核验发现摘要、序号或确认水位异常时，运维可隔离设备：提交当前链头"
+            "序号、摘要、原因与幂等键，服务在同一写事务核对链头并记录不可变事件；"
+            "隔离期间上传、确认、归档、租约领取/完成与批次判定均返回 409，查询、"
+            "链核验与过期租约回收仍可用。解除需带核验范围与幂等键，事务内重新"
+            "核对链头未变化、范围核验为 ok 且无未完成租约才恢复原流程；并发"
+            "隔离/解除由写锁串行化，不会越过状态。"
         ),
-        version="1.10.0",
+        version="1.11.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -507,6 +516,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             body, accepted = app.state.db.submit_batch(device_id, req)
         except BatchConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
+        except QuarantineConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         if not accepted:
             response.status_code = 200
         return body
@@ -589,6 +600,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
         except ConsumerConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
+        except QuarantineConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         except BatchNotFound as exc:
             raise HTTPException(
                 status_code=404,
@@ -636,6 +649,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
         except ArchiveConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
+        except QuarantineConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         if not created:
             response.status_code = 200
         return body
@@ -671,6 +686,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 req.idempotency_key,
             )
         except LeaseConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        except QuarantineConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
         if not created:
             response.status_code = 200
@@ -734,6 +751,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         except LeaseNotFound as exc:
             raise HTTPException(status_code=404, detail=exc.detail)
         except LeaseConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        except QuarantineConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
 
     @app.post(
@@ -812,6 +831,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
         except BatchJudgmentConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
+        except QuarantineConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         if not created:
             response.status_code = 200
         return body
@@ -868,6 +889,98 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
         except ChainVerificationNotFound as exc:
             raise HTTPException(status_code=404, detail=exc.detail)
+
+    # ---------------- 设备异常隔离与解除 ----------------
+
+    @app.post(
+        "/field-devices/{device_id}/quarantine",
+        status_code=201,
+        summary="隔离设备（链核验发现异常后阻止继续处理，幂等）",
+        description=(
+            "提交当前链头序号、摘要、隔离原因与幂等键。服务在同一 SQLite 写事务内"
+            "核对提交的链头与当前链游标一致后，记录不可变隔离事件并进入隔离状态；"
+            "链头不匹配返回 409（head_mismatch，附当前链头）。相同幂等键+相同载荷"
+            "重试返回原事件（HTTP 200，status=already_quarantined）；同键不同载荷"
+            "返回 409（idempotency_key_in_use）；设备已在隔离中返回 409"
+            "（already_quarantined，附活动隔离事件）。隔离期间上传批次、消费者"
+            "确认、归档、租约领取/完成与连续批次判定均返回 409"
+            "（device_quarantined）；查询、链核验与过期租约回收仍可用。"
+        ),
+    )
+    def quarantine_device(
+        req: QuarantineRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            body, created = app.state.db.quarantine_device(
+                device_id,
+                req.head_sequence,
+                req.head_digest,
+                req.reason,
+                req.idempotency_key,
+            )
+        except QuarantineConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.post(
+        "/field-devices/{device_id}/quarantine/release",
+        status_code=201,
+        summary="解除设备隔离（同事务核对链头未变、范围核验 ok、无未完成租约）",
+        description=(
+            "提交核验范围与幂等键。服务在同一 SQLite 写事务内重新核对：链头自隔离"
+            "以来未变化（否则 409 head_changed）、请求范围按 verify-chain 同一套"
+            "规则核验为 ok（否则 409 verification_failed，附问题清单；空链跳过"
+            "范围核验）、设备无未完成租约（否则 409 outstanding_leases，附租约"
+            "清单——过期租约可在隔离期间显式回收后重试）。全部通过后记录不可变"
+            "解除事件并恢复原流程。设备未在隔离中返回 409（not_quarantined）；"
+            "相同幂等键+相同范围重试返回原解除事件（HTTP 200，"
+            "status=already_released）；同键不同范围返回 409"
+            "（idempotency_key_in_use）。"
+        ),
+    )
+    def release_device_quarantine(
+        req: QuarantineReleaseRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            body, created = app.state.db.release_quarantine(
+                device_id,
+                req.from_sequence,
+                req.to_sequence,
+                req.idempotency_key,
+            )
+        except QuarantineConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.get(
+        "/field-devices/{device_id}/quarantine",
+        summary="查询设备隔离状态（当前状态、活动隔离事件与最近事件）",
+    )
+    def get_device_quarantine(
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        return app.state.db.get_quarantine_status(device_id)
+
+    @app.get(
+        "/field-devices/{device_id}/quarantine/events",
+        summary="分页查询设备隔离/解除事件（不可变事件日志，按 id 升序）",
+    )
+    def list_device_quarantine_events(
+        device_id: str = Path(min_length=1, max_length=128),
+        after_id: int = Query(0, ge=0, description="游标：返回 id 大于该值的事件"),
+        limit: int = Query(50, ge=1, le=200),
+    ) -> dict:
+        return app.state.db.list_quarantine_events(
+            device_id, after_id=after_id, limit=limit
+        )
 
     return app
 

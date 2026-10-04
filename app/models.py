@@ -383,3 +383,86 @@ class ChainVerifyRequest(BaseModel):
                 f"from_sequence {self.from_sequence} must be <= to_sequence {self.to_sequence}"
             )
         return self
+
+
+class QuarantineRequest(BaseModel):
+    """隔离设备：提交当前链头序号、摘要、隔离原因与客户端幂等键。
+
+    服务在同一 SQLite 写事务内核对提交的链头与当前链游标一致后，记录不可变
+    隔离事件并进入隔离状态；链头不匹配返回 409（附当前链头）。相同幂等键 +
+    相同载荷重试返回原事件（HTTP 200），同键不同载荷返回 409。
+    """
+
+    head_sequence: int = Field(ge=0, description="当前链头序号（空链为 0）")
+    head_digest: str = Field(
+        default="", description="当前链头摘要（64 位十六进制；空链为空串）"
+    )
+    reason: str = Field(
+        min_length=1,
+        max_length=512,
+        description="隔离原因（运维记录，随事件不可变保存）",
+    )
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（设备内唯一；同键重试返回原事件）",
+    )
+
+    @field_validator("head_digest")
+    @classmethod
+    def _normalize_head_digest(cls, v: str) -> str:
+        s = (v or "").strip().lower()
+        if s and not re.fullmatch(r"[0-9a-f]{64}", s):
+            raise ValueError(
+                "head_digest must be empty or a 64-char lowercase hex sha256"
+            )
+        return s
+
+    @field_validator("idempotency_key", "reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _head_consistent(self) -> "QuarantineRequest":
+        if self.head_sequence == 0 and self.head_digest:
+            raise ValueError(
+                "empty chain head (head_sequence=0) must carry an empty head_digest"
+            )
+        if self.head_sequence >= 1 and not self.head_digest:
+            raise ValueError("head_digest is required when head_sequence >= 1")
+        return self
+
+
+class QuarantineReleaseRequest(BaseModel):
+    """解除设备隔离：提交核验范围与客户端幂等键。
+
+    服务在同一写事务内重新核对链头自隔离以来未变化、请求范围内链核验为 ok
+    且设备无未完成租约，全部通过才记录不可变解除事件并恢复原流程；任一不
+    满足返回 409。相同幂等键 + 相同范围重试返回原解除事件（HTTP 200）。
+    """
+
+    from_sequence: int = Field(ge=1, description="核验区间起始批次序号（含）")
+    to_sequence: int = Field(ge=1, description="核验区间结束批次序号（含）")
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（设备内唯一；同键重试返回原解除事件）",
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _key_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("idempotency_key must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _ordered_range(self) -> "QuarantineReleaseRequest":
+        if self.from_sequence > self.to_sequence:
+            raise ValueError(
+                f"from_sequence {self.from_sequence} must be <= to_sequence {self.to_sequence}"
+            )
+        return self

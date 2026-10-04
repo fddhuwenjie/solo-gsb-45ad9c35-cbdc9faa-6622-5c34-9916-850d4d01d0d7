@@ -82,6 +82,17 @@
 返回快照上限、`ok` 与问题清单（`issue_code`/`sequence`/`expected`/`actual`）；
 并发上传、确认或归档期间结果来自同一快照，核验**不修改任何数据**。
 
+核验发现摘要、序号或确认水位异常时，运维可先用
+`POST /field-devices/{device_id}/quarantine` **隔离设备**，阻止继续处理以免
+扩大损坏：请求提交当前链头序号、摘要、原因与幂等键，服务在**同一 SQLite 写
+事务**内核对链头并记录**不可变事件**。隔离期间上传批次、消费者确认、归档、
+租约领取/完成与连续批次判定均返回 409，查询、链核验与过期租约回收仍可用。
+修复后调用 `POST /field-devices/{device_id}/quarantine/release` **解除隔离**：
+请求携带核验范围与幂等键，服务在同一事务内重新核对链头自隔离以来未变化、
+范围核验为 `ok` 且无未完成租约，全部通过才记录解除事件并恢复原流程；并发
+隔离/解除由写锁串行化，不会越过状态。`GET …/quarantine` 查询当前状态，
+`GET …/quarantine/events` 分页查阅不可变事件日志。
+
 ## 快速开始
 
 单条命令启动（唯一前置要求：Docker 与 Docker Compose）：
@@ -148,6 +159,10 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `GET` | `/field-devices/{device_id}/batch-judgments` | 分页查询设备的连续批次判定（`after_id` 游标 + `limit`） |
 | `GET` | `/field-devices/{device_id}/batch-judgments/{id}` | 查询单次连续批次判定详情（不可变来源：序号范围、各批摘要、合并观测、阈值、`library_version`、判定结果） |
 | `POST` | `/field-devices/{device_id}/verify-chain` | 核验设备批次链一致性（只读快照：重算范围内未归档批次摘要，核对链式引用/序号连续性/链游标/墓碑边界/消费者确认与水位/判定来源摘要；不改数据，空设备或缺批次 404） |
+| `POST` | `/field-devices/{device_id}/quarantine` | 隔离设备：提交当前链头序号/摘要/原因/幂等键，同一写事务核对链头并记录不可变事件（链头不符 409；同键重试 200；重复隔离 409） |
+| `POST` | `/field-devices/{device_id}/quarantine/release` | 解除隔离：同一事务核对链头未变、范围核验 ok、无未完成租约（任一不满足 409；同键重试 200） |
+| `GET` | `/field-devices/{device_id}/quarantine` | 查询设备隔离状态（当前状态、活动隔离事件、最近事件与事件总数） |
+| `GET` | `/field-devices/{device_id}/quarantine/events` | 分页查询设备隔离/解除事件日志（不可变，`after_id` 游标 + `limit`） |
 
 ### 1. 导入特征库（原子发布新版本）
 
@@ -1216,6 +1231,143 @@ curl -s -X POST $DEV/verify-chain \
 快照——每个写操作本身单事务原子提交，故核验结果恒为某一时刻的完整一致
 状态；核验不重写任何表，发现问题后数据库保持原样，可重复核验比对。
 
+### 11. 设备异常隔离与解除（核验发现异常后先阻止继续处理）
+
+链核验发现摘要、序号或确认水位异常时，继续上传、确认、归档或判定都可能
+扩大损坏。运维可先**隔离设备**阻断全部变更类流程，排查修复后再**解除隔离**
+恢复原流程。隔离与解除都记录**不可变事件**，全程幂等、并发安全。
+
+**隔离**：`POST /field-devices/{device_id}/quarantine`
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `head_sequence` | `int≥0` | 当前链头序号（取自 `GET …/cursor` 的 `last_sequence`；空链为 `0`） |
+| `head_digest` | `string` | 当前链头摘要（64 位十六进制；空链为空串 `""`） |
+| `reason` | `string`（1~512） | 隔离原因（随事件不可变保存，便于事后审计） |
+| `idempotency_key` | `string`（1~128） | 客户端幂等键（设备内唯一；网络重试复用同一键） |
+
+服务在**同一个 SQLite 写事务**（`BEGIN IMMEDIATE`）内核对提交的链头与当前
+链游标一致，然后写入不可变隔离事件并置隔离状态——先核对链头是为了防止基于
+过期链头隔离（运维看到的链头与服务端当前链头不一致时说明链仍在变化，返回
+409 `head_mismatch` 并附当前链头，重新取游标后再试）。
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+
+# ① 取当前链头
+curl -s $DEV/cursor
+# → {"last_sequence": 12, "head_digest": "9c10bd…", …}
+
+# ② 提交隔离（链头序号/摘要与游标一致）
+curl -s -X POST $DEV/quarantine -H 'Content-Type: application/json' -d '{
+    "head_sequence": 12,
+    "head_digest": "9c10bd…",
+    "reason": "verify-chain: digest_mismatch at seq 4",
+    "idempotency_key": "ops-2026-10-04-001"
+  }'
+```
+
+```json
+{
+  "status": "quarantined",
+  "device_id": "dev-01",
+  "quarantined": true,
+  "event": {
+    "event_id": 1,
+    "action": "quarantined",
+    "idempotency_key": "ops-2026-10-04-001",
+    "head_sequence": 12,
+    "head_digest": "9c10bd…",
+    "reason": "verify-chain: digest_mismatch at seq 4",
+    "from_sequence": null,
+    "to_sequence": null,
+    "created_at": "2026-10-04T06:00:00+00:00"
+  }
+}
+```
+
+- **幂等**：相同幂等键 + 相同载荷重试返回原事件（HTTP 200，
+  `status=already_quarantined`），不重复记录、不改变当前状态；同键不同载荷
+  返回 409（`idempotency_key_in_use`，附已占用事件）；
+- **重复隔离 409**：设备已在隔离中时，其他幂等键的隔离请求返回 409
+  （`already_quarantined`，附活动隔离事件与隔离时刻）；
+- **并发不越过状态**：隔离/解除与全部变更类操作共用同一写锁串行点，并发
+  隔离只会有一个生效（其余 409），同键并发重试恰好一份 201、其余 200。
+
+**隔离期间的行为**：变更类接口在同一写事务入口被拦截，返回 409
+（`reason=device_quarantined`，`detail` 附 `operation`、隔离原因、隔离时
+链头与隔离时刻）：
+
+| 被拦截（409） | 仍可用 |
+| --- | --- |
+| 上传批次 `POST …/batches` | 全部查询接口（游标/批次/水位/租约/判定/隔离状态） |
+| 消费者确认 `POST …/acknowledgments` | 链核验 `POST …/verify-chain` |
+| 归档 `POST …/archive` | 过期租约回收 `POST …/batch-leases/{id}/recover` |
+| 租约领取 `POST …/batch-leases` | 消费者登记 `POST …/consumers`（不处理批次） |
+| 租约完成 `POST …/batch-leases/{id}/complete` | |
+| 连续批次判定 `POST …/batch-judgments` | |
+
+过期租约回收保持可用是有意的：解除隔离的前置条件之一是**无未完成租约**，
+运维可在隔离期间回收过期租约以满足该条件。
+
+**解除隔离**：`POST /field-devices/{device_id}/quarantine/release`
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `from_sequence` | `int≥1` | 复核区间起始批次序号（含），不得大于 `to_sequence` |
+| `to_sequence` | `int≥1` | 复核区间结束批次序号（含） |
+| `idempotency_key` | `string`（1~128） | 客户端幂等键（设备内唯一；网络重试复用同一键） |
+
+服务在**同一个写事务**内依次核验三项前置条件，全部通过才记录不可变解除
+事件并恢复原流程；任一不满足整体 409 拒绝，设备保持隔离：
+
+| `reason` | 触发条件 | detail 关键字段 |
+| --- | --- | --- |
+| `not_quarantined` | 设备未在隔离中 | — |
+| `head_changed` | 链头自隔离以来发生变化（与隔离事件记录的链头不一致） | `quarantined_head_sequence`/`quarantined_head_digest`/`current_head_sequence`/`current_head_digest` |
+| `verification_failed` | 范围核验非 `ok`（含范围内缺批次） | `issues`/`issue_count` 或 `verification_error` |
+| `outstanding_leases` | 仍有未完成租约（`held`，含过期未回收） | `leases`（`lease_id`/`consumer_id`/区间/是否过期） |
+
+范围核验与 `POST …/verify-chain` 使用**同一套规则、同一事务快照**（空链
+无可核验批次，跳过范围核验）。解除响应附本次核验结果（`verification`，与
+verify-chain 响应同构）：
+
+```bash
+# ③ 排查修复后：先回收过期租约（若有），再复核范围并解除
+curl -s -X POST $DEV/batch-leases/1/recover -H 'Content-Type: application/json' \
+  -d '{"consumer_id": "worker-a"}'
+
+curl -s -X POST $DEV/quarantine/release -H 'Content-Type: application/json' -d '{
+    "from_sequence": 1,
+    "to_sequence": 12,
+    "idempotency_key": "ops-2026-10-04-001-release"
+  }'
+# → 201 {"status": "released", "quarantined": false,
+#        "event": {"action": "released", …}, "verification": {"ok": true, …}}
+```
+
+- **幂等**：相同幂等键 + 相同范围重试返回原解除事件（HTTP 200，
+  `status=already_released`，`verification` 为 `null`——不重复核验）；
+  同键不同范围返回 409（`idempotency_key_in_use`）；
+- **并发不越过状态**：并发解除只会有一个生效（其余 409
+  `not_quarantined`）；解除成功后上传、确认、归档、租约与批次判定立即
+  恢复。
+
+**状态与事件查询**：
+
+```bash
+# 当前状态：normal / quarantined，附活动隔离事件、最近事件与事件总数
+curl -s $DEV/quarantine
+
+# 不可变事件日志（按 id 升序，after_id 游标分页）
+curl -s "$DEV/quarantine/events?limit=50"
+curl -s "$DEV/quarantine/events?after_id=<上一页 next_cursor>&limit=50"
+```
+
+事件记录动作（`quarantined`/`released`）、幂等键、记录时的链头序号与摘要、
+隔离原因（解除事件为 `null`）、解除时的核验范围与时刻；事件只增不改，
+同一设备的同一动作下幂等键唯一。
+
 ## 判定模型与裁决规则
 
 **观测模型**：观测时钟相对真时存在线性钟漂与固定相位差，
@@ -1265,7 +1417,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 消费者批次处理租约 + 草稿回放 + 连续批次判定 + 链一致性核验共 183 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 消费者批次处理租约 + 草稿回放 + 连续批次判定 + 链一致性核验 + 异常隔离与解除共 201 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 
@@ -1282,7 +1434,8 @@ app/
   db.py      SQLite 持久层（不可变特征库版本 + 判定记录 + 草稿回放报告 +
              设备批次链 + 多消费者稀疏确认与安全归档水位 + 连续前缀归档墓碑 +
              消费者批次处理租约（领取/完成/回收、租约占用归档闸门）+
-             连续批次归档前巡检判定不可变来源 + 只读快照链一致性核验，含首次迁移）
+             连续批次归档前巡检判定不可变来源 + 只读快照链一致性核验 +
+             设备异常隔离/解除（不可变事件 + 状态闸门），含首次迁移）
   config.py  环境变量配置
 samples/
   library.json                示例特征库

@@ -89,6 +89,23 @@
   租约过期整体拒绝、不推进。归档不得清除仍被 ``held`` 租约占用的明细；过期
   租约需显式回收（``held → revoked``）后区间才能重新领取。
 
+设备异常隔离与解除（运维在链核验发现摘要、序号或确认水位异常时先阻止继续
+处理，避免扩大损坏）：
+
+- ``device_quarantine_events``：隔离/解除的**不可变事件**日志——动作
+  （``quarantined``/``released``）、设备内唯一的幂等键、记录时的链头序号与
+  摘要、隔离原因（解除事件为空）、解除时的核验范围与时刻；
+- ``device_quarantine``：每台设备至多一行的**当前隔离状态**（存在即隔离中），
+  记录隔离事件 id、原因与隔离时的链头。
+
+隔离在单个 BEGIN IMMEDIATE 事务内核对提交的链头与当前链游标一致后写入事件
+并置状态；同键同载荷重试返回原事件，同键不同载荷或重复隔离返回 409。隔离
+期间上传批次、消费者确认、归档、租约领取/完成与连续批次判定在同一写事务内
+被 ``_require_not_quarantined`` 拦截（409）；查询、链核验与过期租约回收不受
+影响。解除在同一事务内重新核对链头自隔离以来未变化、请求范围内链核验为 ok
+且无未完成租约（``held``，含过期未回收），全部通过才记录解除事件并清除状
+态；任一不满足整体 409 拒绝。写锁串行化保证并发隔离/解除不会越过状态。
+
 首次启动时把旧版平铺 ``aids`` 表整体迁移为初始激活版本（source='migration'），
 并给 ``judgments`` 表补充 ``library_version`` 列；同时为旧库的批次表补充
 ``replay_count`` / ``last_replayed_at`` / ``archived_at`` 列（明细列改为
@@ -290,6 +307,29 @@ CREATE TABLE IF NOT EXISTS batch_lease_items (
     batch_digest TEXT NOT NULL,
     UNIQUE (lease_id, sequence)
 );
+CREATE TABLE IF NOT EXISTS device_quarantine_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id        TEXT NOT NULL,
+    action           TEXT NOT NULL CHECK (action IN ('quarantined', 'released')),
+    idempotency_key  TEXT NOT NULL,
+    head_sequence    INTEGER NOT NULL,
+    head_digest      TEXT NOT NULL,
+    reason           TEXT,
+    from_sequence    INTEGER,
+    to_sequence      INTEGER,
+    created_at       REAL NOT NULL,
+    UNIQUE (device_id, action, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_quarantine_events_device
+    ON device_quarantine_events (device_id, id);
+CREATE TABLE IF NOT EXISTS device_quarantine (
+    device_id            TEXT PRIMARY KEY,
+    quarantine_event_id  INTEGER NOT NULL REFERENCES device_quarantine_events(id),
+    reason               TEXT NOT NULL,
+    head_sequence        INTEGER NOT NULL,
+    head_digest          TEXT NOT NULL,
+    quarantined_at       REAL NOT NULL
+);
 """
 
 
@@ -411,6 +451,19 @@ class LeaseConflict(Exception):
     def __init__(self, *, reason: str, message: str, **extra):
         super().__init__(message)
         self.detail = {"error": "lease_conflict", "reason": reason, "message": message}
+        self.detail.update(extra)
+
+
+class QuarantineConflict(Exception):
+    """设备异常隔离/解除冲突（HTTP 409），detail 附当前状态与期望上下文。"""
+
+    def __init__(self, *, reason: str, message: str, **extra):
+        super().__init__(message)
+        self.detail = {
+            "error": "quarantine_conflict",
+            "reason": reason,
+            "message": message,
+        }
         self.detail.update(extra)
 
 
@@ -934,6 +987,7 @@ class Database:
         ]
         now = time.time()
         with self._write_tx() as conn:
+            self._require_not_quarantined(conn, device_id, "upload_batch")
             row_bid = conn.execute(
                 "SELECT * FROM device_batches WHERE device_id = ? AND batch_id = ?",
                 (device_id, req.batch_id),
@@ -1269,6 +1323,7 @@ class Database:
         """
         now = time.time()
         with self._write_tx() as conn:
+            self._require_not_quarantined(conn, device_id, "acknowledge_batch")
             consumer = conn.execute(
                 "SELECT id, watermark FROM device_consumers "
                 "WHERE device_id = ? AND consumer_id = ?",
@@ -1524,6 +1579,7 @@ class Database:
         """
         now = time.time()
         with self._write_tx() as conn:
+            self._require_not_quarantined(conn, device_id, "archive_prefix")
             chain = conn.execute(
                 "SELECT * FROM device_chains WHERE device_id = ?", (device_id,)
             ).fetchone()
@@ -2008,6 +2064,7 @@ class Database:
         """
         now = time.time()
         with self._write_tx() as conn:
+            self._require_not_quarantined(conn, device_id, "create_batch_judgment")
             existing = conn.execute(
                 "SELECT id FROM batch_judgments WHERE idempotency_key = ?",
                 (idempotency_key,),
@@ -2847,6 +2904,7 @@ class Database:
         """
         now = time.time()
         with self._write_tx() as conn:
+            self._require_not_quarantined(conn, device_id, "claim_lease")
             consumer = conn.execute(
                 "SELECT id, watermark FROM device_consumers "
                 "WHERE device_id = ? AND consumer_id = ?",
@@ -3031,6 +3089,7 @@ class Database:
         now = time.time()
         provided = [(item.sequence, item.batch_digest) for item in items]
         with self._write_tx() as conn:
+            self._require_not_quarantined(conn, device_id, "complete_lease")
             row = conn.execute(
                 "SELECT * FROM batch_leases WHERE id = ?", (lease_id,)
             ).fetchone()
@@ -3340,4 +3399,477 @@ class Database:
             "expires_at": _iso(row["expires_at"]),
             "completed_at": _iso(row["completed_at"]),
             "revoked_at": _iso(row["revoked_at"]),
+        }
+
+    # ---------------- 设备异常隔离与解除 ----------------
+
+    @staticmethod
+    def _quarantine_event_payload(row) -> dict:
+        """组装一条隔离/解除事件（不可变）。"""
+        return {
+            "event_id": row["id"],
+            "device_id": row["device_id"],
+            "action": row["action"],
+            "idempotency_key": row["idempotency_key"],
+            "head_sequence": row["head_sequence"],
+            "head_digest": row["head_digest"],
+            "reason": row["reason"],
+            "from_sequence": row["from_sequence"],
+            "to_sequence": row["to_sequence"],
+            "created_at": _iso(row["created_at"]),
+        }
+
+    @staticmethod
+    def _active_quarantine(conn, device_id: str):
+        """设备当前的隔离状态行（未隔离返回 None）。"""
+        return conn.execute(
+            "SELECT * FROM device_quarantine WHERE device_id = ?", (device_id,)
+        ).fetchone()
+
+    @staticmethod
+    def _chain_head_of(conn, device_id: str) -> tuple[int, str]:
+        """设备链游标的当前链头（无链行为空链头 ``(0, "")``）。"""
+        chain = conn.execute(
+            "SELECT last_sequence, head_digest FROM device_chains WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if chain is None:
+            return 0, ""
+        return chain["last_sequence"], chain["head_digest"]
+
+    def _require_not_quarantined(self, conn, device_id: str, operation: str) -> None:
+        """写事务内检查设备未处于隔离状态；隔离期间抛 409 拦截变更类操作。
+
+        隔离期间被拦截的操作：上传批次、消费者确认、归档、租约领取/完成与
+        连续批次判定。查询、链核验与过期租约回收不经过此检查，始终可用。
+        """
+        active = self._active_quarantine(conn, device_id)
+        if active is not None:
+            raise QuarantineConflict(
+                reason="device_quarantined",
+                message=(
+                    f"device {device_id!r} is quarantined since "
+                    f"{_iso(active['quarantined_at'])} ({active['reason']}); "
+                    f"{operation} is blocked until the quarantine is released"
+                ),
+                device_id=device_id,
+                operation=operation,
+                quarantine_event_id=active["quarantine_event_id"],
+                quarantine_reason=active["reason"],
+                quarantined_head_sequence=active["head_sequence"],
+                quarantined_head_digest=active["head_digest"],
+                quarantined_at=_iso(active["quarantined_at"]),
+            )
+
+    def _quarantine_body(self, conn, device_id: str, event_row, status: str) -> dict:
+        return {
+            "status": status,
+            "device_id": device_id,
+            "quarantined": self._active_quarantine(conn, device_id) is not None,
+            "event": self._quarantine_event_payload(event_row),
+        }
+
+    def _release_body(
+        self, conn, device_id: str, event_row, status: str, verification: dict | None
+    ) -> dict:
+        return {
+            "status": status,
+            "device_id": device_id,
+            "quarantined": self._active_quarantine(conn, device_id) is not None,
+            "event": self._quarantine_event_payload(event_row),
+            "verification": verification,
+        }
+
+    def _find_quarantine_event(self, conn, device_id: str, action: str, key: str):
+        return conn.execute(
+            "SELECT * FROM device_quarantine_events "
+            "WHERE device_id = ? AND action = ? AND idempotency_key = ?",
+            (device_id, action, key),
+        ).fetchone()
+
+    def quarantine_device(
+        self,
+        device_id: str,
+        head_sequence: int,
+        head_digest: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> tuple[dict, bool]:
+        """隔离设备：单事务核对链头并记录不可变隔离事件（幂等）。
+
+        1. 幂等：相同幂等键 + 相同载荷（链头序号/摘要/原因）重试返回原事件
+           （``created=False``，HTTP 200，``status=already_quarantined``，
+           不改变当前状态）；同键不同载荷抛 ``idempotency_key_in_use``（409）；
+        2. 设备已在隔离中抛 ``already_quarantined``（409，附活动隔离事件）——
+           并发隔离由写锁串行化，只会有一个生效，不会越过状态；
+        3. 提交的链头必须与同一事务内读出的当前链游标一致，否则抛
+           ``head_mismatch``（409，附当前链头）——防止基于过期链头隔离；
+        4. 通过后在同一事务写入不可变事件并置隔离状态；此后上传、确认、
+           归档、租约领取/完成与批次判定均被拦截（409）。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            existing = self._find_quarantine_event(
+                conn, device_id, "quarantined", idempotency_key
+            )
+            if existing is not None:
+                if (
+                    existing["head_sequence"] == head_sequence
+                    and existing["head_digest"] == head_digest
+                    and existing["reason"] == reason
+                ):
+                    # 同键同载荷重试：返回原事件，不重复隔离、不改变当前状态
+                    return self._quarantine_body(
+                        conn, device_id, existing, "already_quarantined"
+                    ), False
+                raise QuarantineConflict(
+                    reason="idempotency_key_in_use",
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by "
+                        f"quarantine event {existing['id']} of device {device_id!r} "
+                        "with a different payload"
+                    ),
+                    device_id=device_id,
+                    idempotency_key=idempotency_key,
+                    occupied_by_event=self._quarantine_event_payload(existing),
+                )
+
+            active = self._active_quarantine(conn, device_id)
+            if active is not None:
+                active_event = conn.execute(
+                    "SELECT * FROM device_quarantine_events WHERE id = ?",
+                    (active["quarantine_event_id"],),
+                ).fetchone()
+                raise QuarantineConflict(
+                    reason="already_quarantined",
+                    message=(
+                        f"device {device_id!r} is already quarantined since "
+                        f"{_iso(active['quarantined_at'])}; release it before "
+                        "quarantining again"
+                    ),
+                    device_id=device_id,
+                    active_event=self._quarantine_event_payload(active_event),
+                    quarantined_at=_iso(active["quarantined_at"]),
+                )
+
+            cur_seq, cur_digest = self._chain_head_of(conn, device_id)
+            if cur_seq != head_sequence or cur_digest != head_digest:
+                raise QuarantineConflict(
+                    reason="head_mismatch",
+                    message=(
+                        f"submitted chain head (sequence {head_sequence}, digest "
+                        f"{head_digest!r}) does not match the current head of "
+                        f"device {device_id!r} (sequence {cur_seq}, digest "
+                        f"{cur_digest!r}); refetch the cursor and retry"
+                    ),
+                    device_id=device_id,
+                    submitted_head_sequence=head_sequence,
+                    submitted_head_digest=head_digest,
+                    current_head_sequence=cur_seq,
+                    current_head_digest=cur_digest,
+                )
+
+            try:
+                cur = conn.execute(
+                    "INSERT INTO device_quarantine_events "
+                    "(device_id, action, idempotency_key, head_sequence, head_digest, "
+                    "reason, created_at) "
+                    "VALUES (?, 'quarantined', ?, ?, ?, ?, ?)",
+                    (device_id, idempotency_key, head_sequence, head_digest, reason, now),
+                )
+            except sqlite3.IntegrityError:
+                # 多 worker 下越过进程写锁的并发兜底：同键已被抢先记录，
+                # 按「同键同载荷幂等 / 同键异载荷 409」同一语义处理
+                rival = self._find_quarantine_event(
+                    conn, device_id, "quarantined", idempotency_key
+                )
+                if (
+                    rival is not None
+                    and rival["head_sequence"] == head_sequence
+                    and rival["head_digest"] == head_digest
+                    and rival["reason"] == reason
+                ):
+                    return self._quarantine_body(
+                        conn, device_id, rival, "already_quarantined"
+                    ), False
+                raise QuarantineConflict(
+                    reason="idempotency_key_in_use",
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by a "
+                        f"quarantine event of device {device_id!r}; concurrent "
+                        "quarantines are serialized"
+                    ),
+                    device_id=device_id,
+                    idempotency_key=idempotency_key,
+                    occupied_by_event=(
+                        self._quarantine_event_payload(rival)
+                        if rival is not None
+                        else None
+                    ),
+                )
+            event_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO device_quarantine "
+                "(device_id, quarantine_event_id, reason, head_sequence, head_digest, "
+                "quarantined_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (device_id, event_id, reason, head_sequence, head_digest, now),
+            )
+            event = conn.execute(
+                "SELECT * FROM device_quarantine_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            return self._quarantine_body(conn, device_id, event, "quarantined"), True
+
+    def release_quarantine(
+        self,
+        device_id: str,
+        from_sequence: int,
+        to_sequence: int,
+        idempotency_key: str,
+    ) -> tuple[dict, bool]:
+        """解除设备隔离（单事务，幂等）；全部前置条件在同一事务内核验。
+
+        1. 幂等：相同幂等键 + 相同核验范围重试返回原解除事件
+           （``created=False``，HTTP 200，``status=already_released``，
+           不重复核验、不改变当前状态）；同键不同范围抛
+           ``idempotency_key_in_use``（409）；
+        2. 设备未在隔离中抛 ``not_quarantined``（409）——并发解除由写锁
+           串行化，只会有一个生效，不会越过状态；
+        3. 链头必须自隔离以来未变化（与隔离事件记录的链头一致），否则抛
+           ``head_changed``（409，附隔离时与当前链头）；
+        4. 请求范围按 verify-chain 同一套规则在事务内核验，必须为 ok：
+           范围缺批次或核验发现问题抛 ``verification_failed``（409，附问题
+           清单）；空链（隔离时链头为 0）无可核验批次，跳过范围核验；
+        5. 设备不得有未完成租约（``held``，含过期未回收），否则抛
+           ``outstanding_leases``（409，附租约清单）——过期租约可在隔离
+           期间显式回收后重试；
+        6. 全部通过：同一事务写入不可变解除事件并清除隔离状态，恢复原流程。
+        """
+        now = time.time()
+        with self._write_tx() as conn:
+            existing = self._find_quarantine_event(
+                conn, device_id, "released", idempotency_key
+            )
+            if existing is not None:
+                if (
+                    existing["from_sequence"] == from_sequence
+                    and existing["to_sequence"] == to_sequence
+                ):
+                    # 同键同范围重试：返回原解除事件，不重复核验、不改变状态
+                    return self._release_body(
+                        conn, device_id, existing, "already_released", None
+                    ), False
+                raise QuarantineConflict(
+                    reason="idempotency_key_in_use",
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by "
+                        f"release event {existing['id']} of device {device_id!r} "
+                        f"with range {existing['from_sequence']}.."
+                        f"{existing['to_sequence']}"
+                    ),
+                    device_id=device_id,
+                    idempotency_key=idempotency_key,
+                    occupied_by_event=self._quarantine_event_payload(existing),
+                )
+
+            active = self._active_quarantine(conn, device_id)
+            if active is None:
+                raise QuarantineConflict(
+                    reason="not_quarantined",
+                    message=(
+                        f"device {device_id!r} is not quarantined; nothing to release"
+                    ),
+                    device_id=device_id,
+                )
+
+            cur_seq, cur_digest = self._chain_head_of(conn, device_id)
+            if cur_seq != active["head_sequence"] or cur_digest != active["head_digest"]:
+                raise QuarantineConflict(
+                    reason="head_changed",
+                    message=(
+                        f"chain head of device {device_id!r} changed while "
+                        f"quarantined: quarantined at sequence "
+                        f"{active['head_sequence']} (digest "
+                        f"{active['head_digest']!r}), now at sequence {cur_seq} "
+                        f"(digest {cur_digest!r}); investigate before releasing"
+                    ),
+                    device_id=device_id,
+                    quarantined_head_sequence=active["head_sequence"],
+                    quarantined_head_digest=active["head_digest"],
+                    current_head_sequence=cur_seq,
+                    current_head_digest=cur_digest,
+                )
+
+            # 范围核验：与 verify-chain 同一套规则、同一事务快照；空链无可
+            # 核验批次（隔离时链头为 0 且链头未变化），跳过范围核验
+            verification = None
+            if cur_seq > 0:
+                try:
+                    verification = self._verify_chain(
+                        conn, device_id, from_sequence, to_sequence
+                    )
+                except ChainVerificationNotFound as exc:
+                    raise QuarantineConflict(
+                        reason="verification_failed",
+                        message=(
+                            f"cannot release quarantine of device {device_id!r}: "
+                            f"verification of range {from_sequence}..{to_sequence} "
+                            f"failed: {exc}"
+                        ),
+                        device_id=device_id,
+                        from_sequence=from_sequence,
+                        to_sequence=to_sequence,
+                        verification_error=exc.detail,
+                    ) from exc
+                if not verification["ok"]:
+                    raise QuarantineConflict(
+                        reason="verification_failed",
+                        message=(
+                            f"cannot release quarantine of device {device_id!r}: "
+                            f"verification of range {from_sequence}..{to_sequence} "
+                            f"reports {verification['issue_count']} issue(s)"
+                        ),
+                        device_id=device_id,
+                        from_sequence=from_sequence,
+                        to_sequence=to_sequence,
+                        issue_count=verification["issue_count"],
+                        issues=verification["issues"],
+                    )
+
+            # 无未完成租约：held（含过期未回收）租约仍占用区间，须先完成或
+            # 显式回收（隔离期间回收接口仍可用）
+            held = conn.execute(
+                "SELECT id, consumer_id, from_sequence, to_sequence, expires_at "
+                "FROM batch_leases WHERE device_id = ? AND status = 'held' "
+                "ORDER BY id",
+                (device_id,),
+            ).fetchall()
+            if held:
+                raise QuarantineConflict(
+                    reason="outstanding_leases",
+                    message=(
+                        f"cannot release quarantine of device {device_id!r}: "
+                        f"{len(held)} lease(s) still outstanding; complete them or "
+                        "reclaim expired ones first"
+                    ),
+                    device_id=device_id,
+                    leases=[
+                        {
+                            "lease_id": r["id"],
+                            "consumer_id": r["consumer_id"],
+                            "from_sequence": r["from_sequence"],
+                            "to_sequence": r["to_sequence"],
+                            "expires_at": _iso(r["expires_at"]),
+                            "expired": now >= r["expires_at"],
+                        }
+                        for r in held
+                    ],
+                )
+
+            try:
+                cur = conn.execute(
+                    "INSERT INTO device_quarantine_events "
+                    "(device_id, action, idempotency_key, head_sequence, head_digest, "
+                    "from_sequence, to_sequence, created_at) "
+                    "VALUES (?, 'released', ?, ?, ?, ?, ?, ?)",
+                    (
+                        device_id,
+                        idempotency_key,
+                        cur_seq,
+                        cur_digest,
+                        from_sequence,
+                        to_sequence,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 并发兜底：同键已被抢先记录，按幂等/占用同一语义处理
+                rival = self._find_quarantine_event(
+                    conn, device_id, "released", idempotency_key
+                )
+                if (
+                    rival is not None
+                    and rival["from_sequence"] == from_sequence
+                    and rival["to_sequence"] == to_sequence
+                ):
+                    return self._release_body(
+                        conn, device_id, rival, "already_released", None
+                    ), False
+                raise QuarantineConflict(
+                    reason="idempotency_key_in_use",
+                    message=(
+                        f"idempotency_key {idempotency_key!r} is already used by a "
+                        f"release event of device {device_id!r}; concurrent "
+                        "releases are serialized"
+                    ),
+                    device_id=device_id,
+                    idempotency_key=idempotency_key,
+                    occupied_by_event=(
+                        self._quarantine_event_payload(rival)
+                        if rival is not None
+                        else None
+                    ),
+                )
+            event = conn.execute(
+                "SELECT * FROM device_quarantine_events WHERE id = ?",
+                (int(cur.lastrowid),),
+            ).fetchone()
+            conn.execute(
+                "DELETE FROM device_quarantine WHERE device_id = ?", (device_id,)
+            )
+            return self._release_body(
+                conn, device_id, event, "released", verification
+            ), True
+
+    def get_quarantine_status(self, device_id: str) -> dict:
+        """设备隔离状态：当前是否隔离、活动隔离事件、最近事件与事件总数。"""
+        with closing(self._connect()) as conn:
+            active = self._active_quarantine(conn, device_id)
+            active_event = None
+            if active is not None:
+                active_event = conn.execute(
+                    "SELECT * FROM device_quarantine_events WHERE id = ?",
+                    (active["quarantine_event_id"],),
+                ).fetchone()
+            last = conn.execute(
+                "SELECT * FROM device_quarantine_events "
+                "WHERE device_id = ? ORDER BY id DESC LIMIT 1",
+                (device_id,),
+            ).fetchone()
+            count = conn.execute(
+                "SELECT COUNT(*) AS c FROM device_quarantine_events WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()["c"]
+        return {
+            "device_id": device_id,
+            "status": "quarantined" if active is not None else "normal",
+            "quarantined": active is not None,
+            "active_quarantine": (
+                self._quarantine_event_payload(active_event)
+                if active_event is not None
+                else None
+            ),
+            "last_event": (
+                self._quarantine_event_payload(last) if last is not None else None
+            ),
+            "event_count": count,
+        }
+
+    def list_quarantine_events(
+        self, device_id: str, *, after_id: int = 0, limit: int = 50
+    ) -> dict:
+        """按 id 游标分页列出设备的隔离/解除事件（升序，不可变事件日志）。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM device_quarantine_events "
+                "WHERE device_id = ? AND id > ? ORDER BY id LIMIT ?",
+                (device_id, after_id, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        events = [self._quarantine_event_payload(r) for r in rows]
+        return {
+            "device_id": device_id,
+            "count": len(events),
+            "events": events,
+            "next_cursor": events[-1]["event_id"] if has_more and events else None,
         }
