@@ -13,6 +13,8 @@ from .db import (
     ChainVerificationNotFound,
     ConsumerConflict,
     Database,
+    DeviceIsolated,
+    IsolationConflict,
     LeaseConflict,
     LeaseNotFound,
     ReplayConflict,
@@ -27,6 +29,8 @@ from .models import (
     BatchUploadRequest,
     ChainVerifyRequest,
     ConsumerRegisterRequest,
+    IsolationReleaseRequest,
+    IsolationRequest,
     JudgeRequest,
     LeaseClaimRequest,
     LeaseCompleteRequest,
@@ -121,8 +125,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "租约；完成时逐项核对摘要并在同事务写确认、推进水位、释放租约，"
             "摘要变化/缺批次/租约过期整体拒绝且不推进；归档不清除租约占用的"
             "明细，过期租约显式回收后方可重新领取。"
+            "设备链核验发现异常时可隔离设备：提交当前链头序号、摘要、原因与"
+            "幂等键，服务在同一写事务核对链头并记录不可变事件；隔离期间上传"
+            "批次、消费者确认、归档、租约领取/完成与批次判定均返回 409，查询、"
+            "链核验与过期租约回收仍可用。解除请求带核验范围与幂等键，事务内"
+            "重新核对链头未变化、范围核验为 ok 且无未完成租约，全部通过才"
+            "记录解除事件并恢复原流程；并发隔离/解除由写锁串行化，不会越过"
+            "状态，另提供隔离状态与不可变事件历史查询。"
         ),
-        version="1.10.0",
+        version="1.11.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -496,6 +507,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "不推进链头、不改写首次响应），返回原结果（status=replayed，HTTP 200）；"
             "载荷变化或链头过期返回 409 及期望值"
             "（expected_sequence / expected_previous_digest）。"
+            "设备隔离期间本接口返回 409（device_isolated）。"
         ),
     )
     def upload_device_batch(
@@ -505,6 +517,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
     ) -> dict:
         try:
             body, accepted = app.state.db.submit_batch(device_id, req)
+        except DeviceIsolated as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         except BatchConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
         if not accepted:
@@ -576,6 +590,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "（digest_mismatch 附 expected_digest）。相同确认幂等"
             "（HTTP 200，status=duplicate）；新确认 HTTP 201（status=confirmed）。"
             "稀疏确认与连续水位推进在单个 SQLite 事务内完成，并发确认不会丢失推进。"
+            "设备隔离期间本接口返回 409（device_isolated）。"
         ),
     )
     def acknowledge_device_batch(
@@ -587,6 +602,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             body, created = app.state.db.acknowledge_batch(
                 device_id, req.consumer_id, req.sequence, req.batch_digest
             )
+        except DeviceIsolated as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         except ConsumerConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
         except BatchNotFound as exc:
@@ -622,7 +639,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "前序/本批摘要、条数、首次受理时刻/响应与重放统计；链头摘要与后续"
             "上传不变。重复或更小目标幂等（HTTP 200，status=already_archived）。"
             "与并发确认、消费者登记共用同一写锁串行点：不越过未确认批次，"
-            "archived_through 只进不退。"
+            "archived_through 只进不退。设备隔离期间本接口返回 409"
+            "（device_isolated）。"
         ),
     )
     def archive_device_batches(
@@ -634,6 +652,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             body, created = app.state.db.archive_device_prefix(
                 device_id, req.through_sequence
             )
+        except DeviceIsolated as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         except ArchiveConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
         if not created:
@@ -654,7 +674,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "（HTTP 200），其他幂等键返回 409（active_lease_exists）；租约已过期"
             "时返回 409（lease_expired），需先显式回收。同一区间不会分给同一"
             "消费者的两个租约。水位之后暂无可领取批次时返回 200 "
-            "status=nothing_to_claim。"
+            "status=nothing_to_claim。设备隔离期间本接口返回 409"
+            "（device_isolated）。"
         ),
     )
     def claim_device_batch_lease(
@@ -670,6 +691,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 req.lease_duration_seconds,
                 req.idempotency_key,
             )
+        except DeviceIsolated as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         except LeaseConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
         if not created:
@@ -720,6 +743,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "缺批次/多批次/顺序不符或租约过期（含已回收）时整体 409 拒绝，不"
             "写入任何确认、不推进水位。核对全部通过后幂等写入各批确认、把消费"
             "者连续水位推进至首个缺口，并把租约置为 completed（释放区间）。"
+            "设备隔离期间本接口返回 409（device_isolated）。"
         ),
     )
     def complete_device_batch_lease(
@@ -731,6 +755,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             return app.state.db.complete_lease(
                 device_id, lease_id, req.consumer_id, req.items
             )
+        except DeviceIsolated as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         except LeaseNotFound as exc:
             raise HTTPException(status_code=404, detail=exc.detail)
         except LeaseConflict as exc:
@@ -780,7 +806,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "library_version 作为不可变来源。相同幂等键重试返回原判定"
             "（HTTP 200）；相同键改范围或设备返回 409；范围含墓碑、缺批次或"
             "阈值不一致时整体拒绝且不落判定。写锁串行化：归档或上传并发不得"
-            "使已保存结果引用半个范围。"
+            "使已保存结果引用半个范围。设备隔离期间本接口返回 409"
+            "（device_isolated）。"
         ),
     )
     def create_device_batch_judgment(
@@ -810,6 +837,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 req.to_sequence,
                 runner,
             )
+        except DeviceIsolated as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
         except BatchJudgmentConflict as exc:
             raise HTTPException(status_code=409, detail=exc.detail)
         if not created:
@@ -868,6 +897,99 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
         except ChainVerificationNotFound as exc:
             raise HTTPException(status_code=404, detail=exc.detail)
+
+    # ---------------- 设备异常隔离（应急闸门，不可变事件） ----------------
+
+    @app.post(
+        "/field-devices/{device_id}/isolation",
+        status_code=201,
+        summary="隔离设备（核验发现异常后的应急闸门，幂等）",
+        description=(
+            "提交当前链头序号、链头摘要、隔离原因与幂等键。服务在同一 SQLite "
+            "写事务内核对链头与当前链一致（无批次设备为 0/空串），不一致返回 "
+            "409（stale_chain_head，附服务端当前链头）；核对通过即记录不可变 "
+            "isolated 事件，设备进入隔离状态：上传批次、消费者确认、归档、租约"
+            "领取/完成与批次判定均返回 409（device_isolated），查询、链核验与"
+            "过期租约回收仍可用。相同幂等键且相同参数重试返回原事件"
+            "（HTTP 200）；设备已在隔离中返回 409（already_isolated），键已被"
+            "占用返回 409（idempotency_key_in_use）。"
+        ),
+    )
+    def isolate_field_device(
+        req: IsolationRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            body, created = app.state.db.isolate_device(
+                device_id,
+                req.head_sequence,
+                req.head_digest,
+                req.reason,
+                req.idempotency_key,
+            )
+        except IsolationConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.post(
+        "/field-devices/{device_id}/isolation/release",
+        status_code=201,
+        summary="解除设备隔离（链头未变 + 范围核验 ok + 无未完成租约，幂等）",
+        description=(
+            "提交核验范围与幂等键。服务在同一 SQLite 写事务内依次核对：设备"
+            "处于隔离中（否则 409 not_isolated）；当前链头与隔离事件记录一致"
+            "（否则 409 chain_head_changed）；对 from_sequence..to_sequence "
+            "执行与 verify-chain 相同的只读核验且结果为 ok（范围缺批次 409 "
+            "verification_range_invalid，核验非 ok 409 verification_failed "
+            "并附问题清单；设备无批次时跳过范围核验）；设备上无未完成租约"
+            "（否则 409 leases_outstanding，过期租约可在隔离期间显式回收后"
+            "重试）。全部通过后记录不可变 released 事件（含核验范围与核验"
+            "摘要）并恢复原流程；任一不满足整体拒绝，设备保持隔离。相同幂等"
+            "键且相同范围重试返回原事件（HTTP 200）。"
+        ),
+    )
+    def release_field_device_isolation(
+        req: IsolationReleaseRequest,
+        response: Response,
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        try:
+            body, created = app.state.db.release_device_isolation(
+                device_id,
+                req.from_sequence,
+                req.to_sequence,
+                req.idempotency_key,
+            )
+        except IsolationConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.detail)
+        if not created:
+            response.status_code = 200
+        return body
+
+    @app.get(
+        "/field-devices/{device_id}/isolation",
+        summary="查询设备隔离状态（是否隔离中、生效中的隔离事件与最近事件）",
+    )
+    def get_field_device_isolation(
+        device_id: str = Path(min_length=1, max_length=128),
+    ) -> dict:
+        return app.state.db.get_isolation_status(device_id)
+
+    @app.get(
+        "/field-devices/{device_id}/isolation/events",
+        summary="分页查询设备隔离/解除事件历史（按 id 升序，不可变）",
+    )
+    def list_field_device_isolation_events(
+        device_id: str = Path(min_length=1, max_length=128),
+        after_id: int = Query(0, ge=0, description="游标：返回 id 大于该值的事件"),
+        limit: int = Query(50, ge=1, le=200),
+    ) -> dict:
+        return app.state.db.list_isolation_events(
+            device_id, after_id=after_id, limit=limit
+        )
 
     return app
 

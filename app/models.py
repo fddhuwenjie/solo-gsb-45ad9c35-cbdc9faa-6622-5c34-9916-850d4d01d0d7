@@ -365,6 +365,104 @@ class ArchiveRequest(BaseModel):
     )
 
 
+class IsolationRequest(BaseModel):
+    """隔离设备：提交当前链头序号、摘要、隔离原因与客户端幂等键。
+
+    服务在同一 SQLite 写事务内核对链头（``head_sequence`` / ``head_digest``
+    必须等于设备当前链头；无批次设备为 ``0`` / 空串）并记录不可变隔离事件。
+    相同幂等键且相同参数的重试返回原事件（HTTP 200）；键已被占用或设备已在
+    隔离中返回 409。
+    """
+
+    head_sequence: int = Field(
+        ge=0, description="当前链头序号（无批次设备为 0）"
+    )
+    head_digest: str = Field(
+        default="",
+        description="当前链头摘要（64 位十六进制小写；无批次设备为空串）",
+    )
+    reason: str = Field(
+        min_length=1,
+        max_length=500,
+        description="隔离原因（运维备注，随事件不可变保存）",
+    )
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（设备内按动作唯一；同键同参数重试返回原事件）",
+    )
+
+    @field_validator("head_digest")
+    @classmethod
+    def _normalize_head_digest(cls, v: str) -> str:
+        s = (v or "").strip().lower()
+        if s and not re.fullmatch(r"[0-9a-f]{64}", s):
+            raise ValueError(
+                "head_digest must be empty or a 64-char lowercase hex sha256"
+            )
+        return s
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("reason must not be blank")
+        return v
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _key_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("idempotency_key must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _head_consistent(self) -> "IsolationRequest":
+        if self.head_sequence == 0 and self.head_digest != "":
+            raise ValueError(
+                "head_digest must be empty when head_sequence is 0 (empty chain)"
+            )
+        if self.head_sequence >= 1 and self.head_digest == "":
+            raise ValueError(
+                "head_digest must be the 64-char chain head digest "
+                "when head_sequence >= 1"
+            )
+        return self
+
+
+class IsolationReleaseRequest(BaseModel):
+    """解除设备隔离：携带核验范围与客户端幂等键。
+
+    服务在同一写事务内重新核对链头与隔离时记录的一致、对
+    ``from_sequence..to_sequence`` 执行链一致性核验且结果为 ok、并确认设备
+    上无未完成租约，全部通过才记录不可变解除事件并恢复原流程；任一不满足
+    整体拒绝（409），设备保持隔离。
+    """
+
+    from_sequence: int = Field(ge=1, description="解除前核验区间起始批次序号（含）")
+    to_sequence: int = Field(ge=1, description="解除前核验区间结束批次序号（含）")
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        description="客户端生成的幂等键（设备内按动作唯一；同键同参数重试返回原事件）",
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _key_non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("idempotency_key must not be blank")
+        return v
+
+    @model_validator(mode="after")
+    def _ordered_range(self) -> "IsolationReleaseRequest":
+        if self.from_sequence > self.to_sequence:
+            raise ValueError(
+                f"from_sequence {self.from_sequence} must be <= to_sequence {self.to_sequence}"
+            )
+        return self
+
+
 class ChainVerifyRequest(BaseModel):
     """设备批次链一致性核验：提交序号范围，服务在只读事务快照内核验。
 

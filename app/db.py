@@ -89,6 +89,20 @@
   租约过期整体拒绝、不推进。归档不得清除仍被 ``held`` 租约占用的明细；过期
   租约需显式回收（``held → revoked``）后区间才能重新领取。
 
+设备异常隔离（核验发现摘要、序号或确认水位异常后的应急闸门）：
+
+- ``device_isolation_events``：隔离/解除的**不可变事件**（设备、动作
+  ``isolated``/``released``、幂等键、原因、事件时核对过的链头序号与摘要、
+  解除时的核验范围与核验摘要、时刻）。设备当前状态由最新一条事件推导：
+  ``isolated`` 为隔离中，``released`` 或无事件为正常。幂等键在
+  （设备, 动作）内唯一（唯一索引兜底并发），同键同参数重试在该事件仍为
+  最新事件时返回原事件；
+- 隔离在单个 BEGIN IMMEDIATE 事务内核对请求提交的链头与当前链头一致后
+  落事件；隔离期间上传批次、消费者确认、归档、租约领取/完成与连续批次
+  判定在同一写事务入口检查并整体拒绝（409），查询、链核验与过期租约回收
+  不受影响；解除在同一事务内重新核对链头未变化、范围核验为 ok 且无未完成
+  租约，任一不满足整体拒绝。写锁串行化保证并发隔离/解除不越过状态。
+
 首次启动时把旧版平铺 ``aids`` 表整体迁移为初始激活版本（source='migration'），
 并给 ``judgments`` 表补充 ``library_version`` 列；同时为旧库的批次表补充
 ``replay_count`` / ``last_replayed_at`` / ``archived_at`` 列（明细列改为
@@ -290,6 +304,24 @@ CREATE TABLE IF NOT EXISTS batch_lease_items (
     batch_digest TEXT NOT NULL,
     UNIQUE (lease_id, sequence)
 );
+CREATE TABLE IF NOT EXISTS device_isolation_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id        TEXT NOT NULL,
+    action           TEXT NOT NULL CHECK (action IN ('isolated', 'released')),
+    idempotency_key  TEXT NOT NULL,
+    reason           TEXT,
+    head_sequence    INTEGER NOT NULL,
+    head_digest      TEXT NOT NULL,
+    verify_from      INTEGER,
+    verify_to        INTEGER,
+    verification     TEXT,
+    created_at       REAL NOT NULL
+);
+-- 幂等键在 (设备, 动作) 内唯一：同键同参数重试返回原事件，他参占用 409
+CREATE UNIQUE INDEX IF NOT EXISTS idx_isolation_events_action_key
+    ON device_isolation_events (device_id, action, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_isolation_events_device
+    ON device_isolation_events (device_id, id);
 """
 
 
@@ -411,6 +443,24 @@ class LeaseConflict(Exception):
     def __init__(self, *, reason: str, message: str, **extra):
         super().__init__(message)
         self.detail = {"error": "lease_conflict", "reason": reason, "message": message}
+        self.detail.update(extra)
+
+
+class DeviceIsolated(Exception):
+    """设备处于隔离状态（HTTP 409）：处理类写操作被拒绝，detail 附生效中的隔离事件。"""
+
+    def __init__(self, *, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "device_isolated", "message": message}
+        self.detail.update(extra)
+
+
+class IsolationConflict(Exception):
+    """隔离/解除请求冲突（HTTP 409）：状态机不允许、链头不符、核验未过或租约未清。"""
+
+    def __init__(self, *, reason: str, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": "isolation_conflict", "reason": reason, "message": message}
         self.detail.update(extra)
 
 
@@ -934,6 +984,7 @@ class Database:
         ]
         now = time.time()
         with self._write_tx() as conn:
+            self._assert_not_isolated(conn, device_id)
             row_bid = conn.execute(
                 "SELECT * FROM device_batches WHERE device_id = ? AND batch_id = ?",
                 (device_id, req.batch_id),
@@ -1269,6 +1320,7 @@ class Database:
         """
         now = time.time()
         with self._write_tx() as conn:
+            self._assert_not_isolated(conn, device_id)
             consumer = conn.execute(
                 "SELECT id, watermark FROM device_consumers "
                 "WHERE device_id = ? AND consumer_id = ?",
@@ -1524,6 +1576,7 @@ class Database:
         """
         now = time.time()
         with self._write_tx() as conn:
+            self._assert_not_isolated(conn, device_id)
             chain = conn.execute(
                 "SELECT * FROM device_chains WHERE device_id = ?", (device_id,)
             ).fetchone()
@@ -2008,6 +2061,7 @@ class Database:
         """
         now = time.time()
         with self._write_tx() as conn:
+            self._assert_not_isolated(conn, device_id)
             existing = conn.execute(
                 "SELECT id FROM batch_judgments WHERE idempotency_key = ?",
                 (idempotency_key,),
@@ -2847,6 +2901,7 @@ class Database:
         """
         now = time.time()
         with self._write_tx() as conn:
+            self._assert_not_isolated(conn, device_id)
             consumer = conn.execute(
                 "SELECT id, watermark FROM device_consumers "
                 "WHERE device_id = ? AND consumer_id = ?",
@@ -3031,6 +3086,7 @@ class Database:
         now = time.time()
         provided = [(item.sequence, item.batch_digest) for item in items]
         with self._write_tx() as conn:
+            self._assert_not_isolated(conn, device_id)
             row = conn.execute(
                 "SELECT * FROM batch_leases WHERE id = ?", (lease_id,)
             ).fetchone()
@@ -3340,4 +3396,419 @@ class Database:
             "expires_at": _iso(row["expires_at"]),
             "completed_at": _iso(row["completed_at"]),
             "revoked_at": _iso(row["revoked_at"]),
+        }
+
+    # ---------------- 设备异常隔离（应急闸门，不可变事件） ----------------
+
+    @staticmethod
+    def _isolation_event_view(row) -> dict:
+        """组装一条隔离/解除事件（不可变；解除事件附核验范围与核验摘要）。"""
+        return {
+            "event_id": row["id"],
+            "device_id": row["device_id"],
+            "action": row["action"],
+            "reason": row["reason"],
+            "idempotency_key": row["idempotency_key"],
+            "head_sequence": row["head_sequence"],
+            "head_digest": row["head_digest"],
+            "verify_from": row["verify_from"],
+            "verify_to": row["verify_to"],
+            "verification": (
+                json.loads(row["verification"]) if row["verification"] else None
+            ),
+            "created_at": _iso(row["created_at"]),
+        }
+
+    @staticmethod
+    def _latest_isolation_event(conn, device_id: str):
+        """设备最新一条隔离事件；设备状态由它推导（isolated=隔离中）。"""
+        return conn.execute(
+            "SELECT * FROM device_isolation_events WHERE device_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (device_id,),
+        ).fetchone()
+
+    def _assert_not_isolated(self, conn, device_id: str) -> None:
+        """处理类写操作入口检查（写事务内）：设备隔离中抛 :class:`DeviceIsolated`。
+
+        上传批次、消费者确认、归档、租约领取/完成与连续批次判定共用本检查；
+        查询、链核验与过期租约回收不经过这里，隔离期间仍可用。
+        """
+        row = self._latest_isolation_event(conn, device_id)
+        if row is not None and row["action"] == "isolated":
+            raise DeviceIsolated(
+                message=(
+                    f"device {device_id!r} is isolated since "
+                    f"{_iso(row['created_at'])}: {row['reason']}"
+                ),
+                device_id=device_id,
+                isolation_event_id=row["id"],
+                isolation_reason=row["reason"],
+                isolated_at=_iso(row["created_at"]),
+                head_sequence=row["head_sequence"],
+                head_digest=row["head_digest"],
+            )
+
+    def _isolation_key_resolution(
+        self, conn, device_id: str, action: str, idempotency_key: str, params: dict
+    ):
+        """同动作同键事件处理：``('proceed', None)`` / ``('retry', row)`` /
+        ``('conflict', row)``。
+
+        同键同参数且该事件仍是最新事件（设备状态仍由它决定）时为安全重试；
+        其余同键情形（参数不同，或状态已随后续事件推进）一律视为键已占用。
+        """
+        existing = conn.execute(
+            "SELECT * FROM device_isolation_events "
+            "WHERE device_id = ? AND action = ? AND idempotency_key = ?",
+            (device_id, action, idempotency_key),
+        ).fetchone()
+        if existing is None:
+            return "proceed", None
+        latest = self._latest_isolation_event(conn, device_id)
+        match = all(existing[k] == v for k, v in params.items())
+        if match and latest is not None and latest["id"] == existing["id"]:
+            return "retry", existing
+        return "conflict", existing
+
+    def _isolation_key_conflict(
+        self, device_id: str, idempotency_key: str, existing
+    ) -> IsolationConflict:
+        return IsolationConflict(
+            reason="idempotency_key_in_use",
+            message=(
+                f"idempotency_key {idempotency_key!r} is already used by "
+                f"isolation event {existing['id']} of device {device_id!r}; "
+                "use a new key for a new isolation action"
+            ),
+            device_id=device_id,
+            idempotency_key=idempotency_key,
+            occupied_by_event=self._isolation_event_view(existing),
+        )
+
+    @staticmethod
+    def _chain_head_of(conn, device_id: str) -> tuple[int, str]:
+        """设备当前链头（无链行时为 0 / 空串，与游标接口的空设备语义一致）。"""
+        chain = conn.execute(
+            "SELECT last_sequence, head_digest FROM device_chains WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if chain is None:
+            return 0, ""
+        return chain["last_sequence"], chain["head_digest"]
+
+    def isolate_device(
+        self,
+        device_id: str,
+        head_sequence: int,
+        head_digest: str,
+        reason: str,
+        idempotency_key: str,
+    ) -> tuple[dict, bool]:
+        """隔离设备（单事务，幂等）：核对链头并记录不可变隔离事件。
+
+        - 相同幂等键且相同参数（链头序号/摘要/原因）重试，且该事件仍是设备
+          最新事件时返回原事件（``created=False``，HTTP 200）；键已被占用
+          （参数不同或状态已推进）抛 ``idempotency_key_in_use``（409）；
+        - 设备已在隔离中（最新事件为 ``isolated``）抛 ``already_isolated``
+          （409，附生效中的隔离事件）；
+        - 提交的链头与同一事务内读出的当前链头不一致抛 ``stale_chain_head``
+          （409，附服务端当前链头）；无批次设备的链头为 ``0`` / 空串；
+        - 通过后在同一事务插入不可变 ``isolated`` 事件；写锁 + BEGIN
+          IMMEDIATE 串行化并发隔离/解除，唯一索引兜底多 worker 并发，状态
+          机不会被并发请求越过。
+        """
+        now = time.time()
+        params = {
+            "head_sequence": head_sequence,
+            "head_digest": head_digest,
+            "reason": reason,
+        }
+        with self._write_tx() as conn:
+            verdict, existing = self._isolation_key_resolution(
+                conn, device_id, "isolated", idempotency_key, params
+            )
+            if verdict == "retry":
+                return {
+                    "status": "isolated",
+                    "device_id": device_id,
+                    "isolation": self._isolation_event_view(existing),
+                }, False
+            if verdict == "conflict":
+                raise self._isolation_key_conflict(device_id, idempotency_key, existing)
+
+            latest = self._latest_isolation_event(conn, device_id)
+            if latest is not None and latest["action"] == "isolated":
+                raise IsolationConflict(
+                    reason="already_isolated",
+                    message=(
+                        f"device {device_id!r} is already isolated by event "
+                        f"{latest['id']} since {_iso(latest['created_at'])}"
+                    ),
+                    device_id=device_id,
+                    current_isolation=self._isolation_event_view(latest),
+                )
+
+            cur_seq, cur_digest = self._chain_head_of(conn, device_id)
+            if cur_seq != head_sequence or cur_digest != head_digest:
+                raise IsolationConflict(
+                    reason="stale_chain_head",
+                    message=(
+                        f"submitted chain head (sequence {head_sequence}, digest "
+                        f"{head_digest!r}) does not match the current chain head of "
+                        f"device {device_id!r} (sequence {cur_seq}, digest "
+                        f"{cur_digest!r}); re-read the cursor and retry"
+                    ),
+                    device_id=device_id,
+                    expected_head_sequence=cur_seq,
+                    expected_head_digest=cur_digest,
+                    provided_head_sequence=head_sequence,
+                    provided_head_digest=head_digest,
+                )
+
+            try:
+                cur = conn.execute(
+                    "INSERT INTO device_isolation_events "
+                    "(device_id, action, idempotency_key, reason, head_sequence, "
+                    "head_digest, created_at) "
+                    "VALUES (?, 'isolated', ?, ?, ?, ?, ?)",
+                    (device_id, idempotency_key, reason, head_sequence, head_digest, now),
+                )
+            except sqlite3.IntegrityError:
+                # 多 worker 下越过进程写锁的并发兜底：重读同键事件按同一语义处理
+                verdict, existing = self._isolation_key_resolution(
+                    conn, device_id, "isolated", idempotency_key, params
+                )
+                if verdict == "retry":
+                    return {
+                        "status": "isolated",
+                        "device_id": device_id,
+                        "isolation": self._isolation_event_view(existing),
+                    }, False
+                raise self._isolation_key_conflict(device_id, idempotency_key, existing)
+            row = conn.execute(
+                "SELECT * FROM device_isolation_events WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            return {
+                "status": "isolated",
+                "device_id": device_id,
+                "isolation": self._isolation_event_view(row),
+            }, True
+
+    def release_device_isolation(
+        self,
+        device_id: str,
+        from_sequence: int,
+        to_sequence: int,
+        idempotency_key: str,
+    ) -> tuple[dict, bool]:
+        """解除设备隔离（单事务，幂等）：链头未变 + 范围核验 ok + 无未完成租约。
+
+        在同一 BEGIN IMMEDIATE 事务内依次核对（任一不满足整体拒绝，设备保持
+        隔离，不落任何事件）：
+
+        1. 设备必须处于隔离中，否则抛 ``not_isolated``（409）；
+        2. 当前链头必须与隔离事件记录的链头一致，否则抛
+           ``chain_head_changed``（409，附记录值与当前值）；
+        3. 设备有批次时对 ``from_sequence..to_sequence`` 执行与
+           ``verify_chain`` 相同的只读核验：范围缺批次抛
+           ``verification_range_invalid``，结果非 ok 抛 ``verification_failed``
+           （附问题清单）；设备无批次时空链视为 ok，跳过范围核验；
+        4. 设备上不得有未完成租约（``held``，含过期未回收），否则抛
+           ``leases_outstanding``（409，附租约清单）——过期租约可在隔离期间
+           显式回收后重试解除。
+
+        全部通过后记录不可变 ``released`` 事件（含核验范围与核验摘要），设备
+        恢复原流程。相同幂等键且相同范围的重试在该事件仍为最新事件时返回原
+        事件（HTTP 200）；键已被占用抛 ``idempotency_key_in_use``（409）。
+        """
+        now = time.time()
+        params = {"verify_from": from_sequence, "verify_to": to_sequence}
+        with self._write_tx() as conn:
+            verdict, existing = self._isolation_key_resolution(
+                conn, device_id, "released", idempotency_key, params
+            )
+            if verdict == "retry":
+                return {
+                    "status": "released",
+                    "device_id": device_id,
+                    "release": self._isolation_event_view(existing),
+                }, False
+            if verdict == "conflict":
+                raise self._isolation_key_conflict(device_id, idempotency_key, existing)
+
+            latest = self._latest_isolation_event(conn, device_id)
+            if latest is None or latest["action"] != "isolated":
+                raise IsolationConflict(
+                    reason="not_isolated",
+                    message=(
+                        f"device {device_id!r} is not isolated; nothing to release"
+                    ),
+                    device_id=device_id,
+                    last_event=(
+                        self._isolation_event_view(latest)
+                        if latest is not None
+                        else None
+                    ),
+                )
+            isolating = latest
+
+            cur_seq, cur_digest = self._chain_head_of(conn, device_id)
+            if (
+                cur_seq != isolating["head_sequence"]
+                or cur_digest != isolating["head_digest"]
+            ):
+                raise IsolationConflict(
+                    reason="chain_head_changed",
+                    message=(
+                        f"chain head of device {device_id!r} changed while isolated: "
+                        f"recorded at isolation (sequence "
+                        f"{isolating['head_sequence']}, digest "
+                        f"{isolating['head_digest']!r}) != current (sequence "
+                        f"{cur_seq}, digest {cur_digest!r}); investigate before "
+                        "releasing"
+                    ),
+                    device_id=device_id,
+                    isolation_head_sequence=isolating["head_sequence"],
+                    isolation_head_digest=isolating["head_digest"],
+                    current_head_sequence=cur_seq,
+                    current_head_digest=cur_digest,
+                )
+
+            verification = None
+            if cur_seq >= 1:
+                # 与 verify_chain 相同的只读核验，在解除事务的同一快照内执行
+                try:
+                    result = self._verify_chain(
+                        conn, device_id, from_sequence, to_sequence
+                    )
+                except ChainVerificationNotFound as exc:
+                    raise IsolationConflict(
+                        reason="verification_range_invalid",
+                        message=str(exc),
+                        device_id=device_id,
+                        verification=exc.detail,
+                    )
+                if not result["ok"]:
+                    raise IsolationConflict(
+                        reason="verification_failed",
+                        message=(
+                            f"chain verification of range "
+                            f"{from_sequence}..{to_sequence} on device "
+                            f"{device_id!r} reported {result['issue_count']} "
+                            "issue(s); resolve them before releasing the isolation"
+                        ),
+                        device_id=device_id,
+                        from_sequence=from_sequence,
+                        to_sequence=to_sequence,
+                        issue_count=result["issue_count"],
+                        issues=result["issues"],
+                    )
+                verification = {
+                    "from_sequence": result["from_sequence"],
+                    "to_sequence": result["to_sequence"],
+                    "ok": result["ok"],
+                    "checked_batches": result["checked_batches"],
+                    "recomputed_batches": result["recomputed_batches"],
+                    "archived_batches": result["archived_batches"],
+                    "checked_acknowledgments": result["checked_acknowledgments"],
+                    "checked_judgment_sources": result["checked_judgment_sources"],
+                    "snapshot": result["snapshot"],
+                }
+
+            outstanding = self._held_lease_views(conn, device_id, now)
+            if outstanding:
+                raise IsolationConflict(
+                    reason="leases_outstanding",
+                    message=(
+                        f"{len(outstanding)} lease(s) still outstanding on device "
+                        f"{device_id!r}; wait for expiry and reclaim them before "
+                        "releasing the isolation"
+                    ),
+                    device_id=device_id,
+                    outstanding_leases=outstanding,
+                )
+
+            try:
+                cur = conn.execute(
+                    "INSERT INTO device_isolation_events "
+                    "(device_id, action, idempotency_key, reason, head_sequence, "
+                    "head_digest, verify_from, verify_to, verification, created_at) "
+                    "VALUES (?, 'released', ?, NULL, ?, ?, ?, ?, ?, ?)",
+                    (
+                        device_id,
+                        idempotency_key,
+                        cur_seq,
+                        cur_digest,
+                        from_sequence,
+                        to_sequence,
+                        json.dumps(verification, ensure_ascii=False)
+                        if verification is not None
+                        else None,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # 多 worker 并发兜底：同键事件已被抢先记录，按同一语义处理
+                verdict, existing = self._isolation_key_resolution(
+                    conn, device_id, "released", idempotency_key, params
+                )
+                if verdict == "retry":
+                    return {
+                        "status": "released",
+                        "device_id": device_id,
+                        "release": self._isolation_event_view(existing),
+                    }, False
+                raise self._isolation_key_conflict(device_id, idempotency_key, existing)
+            row = conn.execute(
+                "SELECT * FROM device_isolation_events WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            return {
+                "status": "released",
+                "device_id": device_id,
+                "release": self._isolation_event_view(row),
+            }, True
+
+    def get_isolation_status(self, device_id: str) -> dict:
+        """设备隔离状态查询：是否隔离中、生效中的隔离事件、最近事件与事件总数。"""
+        with closing(self._connect()) as conn:
+            latest = self._latest_isolation_event(conn, device_id)
+            count = conn.execute(
+                "SELECT COUNT(*) AS c FROM device_isolation_events WHERE device_id = ?",
+                (device_id,),
+            ).fetchone()["c"]
+        isolated = latest is not None and latest["action"] == "isolated"
+        return {
+            "device_id": device_id,
+            "isolated": isolated,
+            "status": "isolated" if isolated else "normal",
+            "current_isolation": (
+                self._isolation_event_view(latest) if isolated else None
+            ),
+            "last_event": (
+                self._isolation_event_view(latest) if latest is not None else None
+            ),
+            "event_count": count,
+        }
+
+    def list_isolation_events(
+        self, device_id: str, *, after_id: int = 0, limit: int = 50
+    ) -> dict:
+        """按 id 游标分页列出设备的隔离/解除事件（升序，不可变历史）。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM device_isolation_events "
+                "WHERE device_id = ? AND id > ? ORDER BY id LIMIT ?",
+                (device_id, after_id, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items = [self._isolation_event_view(r) for r in rows]
+        return {
+            "device_id": device_id,
+            "count": len(items),
+            "events": items,
+            "next_cursor": items[-1]["event_id"] if has_more and items else None,
         }
